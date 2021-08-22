@@ -1,34 +1,17 @@
 #!/usr/bin/env python3
 import os
-import random
 import requests
 import time
 import logging
 import argparse
-import subprocess
 from threading import Thread
 
 from prometheus_client import start_http_server, Gauge, Histogram
 
-from bme280 import BME280
-from enviroplus import gas
-from pms5003 import PMS5003, ReadTimeoutError as pmsReadTimeoutError
-
 from influxdb_client import InfluxDBClient, Point
 from influxdb_client.client.write_api import SYNCHRONOUS
 
-
-try:
-    from smbus2 import SMBus
-except ImportError:
-    from smbus import SMBus
-
-try:
-    # Transitional fix for breaking change in LTR559
-    from ltr559 import LTR559
-    ltr559 = LTR559()
-except ImportError:
-    import ltr559
+from enviroplus_api import get_temperature, get_humidity, get_pressure, get_light, get_gas, get_particulates
 
 logging.basicConfig(
     format='%(asctime)s.%(msecs)03d %(levelname)-8s %(message)s',
@@ -44,10 +27,6 @@ Press Ctrl+C to exit!
 """)
 
 DEBUG = os.getenv('DEBUG', 'false') == 'true'
-
-bus = SMBus(1)
-bme280 = BME280(i2c_dev=bus)
-pms5003 = PMS5003()
 
 TEMPERATURE = Gauge('temperature','Temperature measured (*C)')
 PRESSURE = Gauge('pressure','Pressure measured (hPa)')
@@ -83,101 +62,55 @@ influxdb_api = influxdb_client.write_api(write_options=SYNCHRONOUS)
 # Setup Luftdaten
 LUFTDATEN_TIME_BETWEEN_POSTS = int(os.getenv('LUFTDATEN_TIME_BETWEEN_POSTS', '30'))
 
-# Sometimes the sensors can't be read. Resetting the i2c 
-def reset_i2c():
-    subprocess.run(['i2cdetect', '-y', '1'])
-    time.sleep(2)
+# Get env var for temperature factor
+ENVIROPLUS_FACTOR = float(os.getenv('ENVIROPLUS_FACTOR', 0)) or False
 
-
-# Get the temperature of the CPU for compensation
-def get_cpu_temperature():
-    with open("/sys/class/thermal/thermal_zone0/temp", "r") as f:
-        temp = f.read()
-        temp = int(temp) / 1000.0
-    return temp
-
-def get_temperature(factor):
-    """Get temperature from the weather sensor"""
-    # Tuning factor for compensation. Decrease this number to adjust the
-    # temperature down, and increase to adjust up
-    raw_temp = bme280.get_temperature()
-
-    if factor:
-        cpu_temps = [get_cpu_temperature()] * 5
-        cpu_temp = get_cpu_temperature()
-        # Smooth out with some averaging to decrease jitter
-        cpu_temps = cpu_temps[1:] + [cpu_temp]
-        avg_cpu_temp = sum(cpu_temps) / float(len(cpu_temps))
-        temperature = raw_temp - ((avg_cpu_temp - raw_temp) / factor)
-    else:
-        temperature = raw_temp
+def read_temperature(factor):
+    """Get temperature from the api"""
+    temperature = get_temperature(factor)
 
     TEMPERATURE.set(temperature)   # Set to a given value
 
-def get_pressure():
-    """Get pressure from the weather sensor"""
-    try:
-        pressure = bme280.get_pressure()
-        PRESSURE.set(pressure)
-    except IOError:
-        logging.error("Could not get pressure readings. Resetting i2c.")
-        reset_i2c()
+def read_pressure():
+    """Get pressure from the api"""
+    pressure = get_pressure()
+    PRESSURE.set(pressure)
 
-def get_humidity():
-    """Get humidity from the weather sensor"""
-    try:
-        humidity = bme280.get_humidity()
-        HUMIDITY.set(humidity)
-    except IOError:
-        logging.error("Could not get humidity readings. Resetting i2c.")
-        reset_i2c()
+def read_humidity():
+    """Get humidity from the api"""
+    humidity = get_humidity()
+    HUMIDITY.set(humidity)
 
-def get_gas():
+def read_gas():
     """Get all gas readings"""
-    try:
-        readings = gas.read_all()
+    readings = get_gas()
 
-        OXIDISING.set(readings.oxidising)
-        OXIDISING_HIST.observe(readings.oxidising)
+    OXIDISING.set(readings.oxidising)
+    OXIDISING_HIST.observe(readings.oxidising)
 
-        REDUCING.set(readings.reducing)
-        REDUCING_HIST.observe(readings.reducing)
+    REDUCING.set(readings.reducing)
+    REDUCING_HIST.observe(readings.reducing)
 
-        NH3.set(readings.nh3)
-        NH3_HIST.observe(readings.nh3)
-    except IOError:
-        logging.error("Could not get gas readings. Resetting i2c.")
-        reset_i2c()
+    NH3.set(readings.nh3)
+    NH3_HIST.observe(readings.nh3)
 
-def get_light():
+def read_light():
     """Get all light readings"""
-    try:
-       lux = ltr559.get_lux()
-       prox = ltr559.get_proximity()
+    light = get_light()
+    LUX.set(light["lux"])
+    PROXIMITY.set(light["prox"])
 
-       LUX.set(lux)
-       PROXIMITY.set(prox)
-    except IOError:
-        logging.error("Could not get lux and proximity readings. Resetting i2c.")
-        reset_i2c()
-
-def get_particulates():
+def read_particulates():
     """Get the particulate matter readings"""
-    try:
-        pms_data = pms5003.read()
-    except pmsReadTimeoutError:
-        logging.warning("Failed to read PMS5003")
-    except IOError:
-        logging.error("Could not get particulate matter readings. Resetting i2c.")
-        reset_i2c()
-    else:
-        PM1.set(pms_data.pm_ug_per_m3(1.0))
-        PM25.set(pms_data.pm_ug_per_m3(2.5))
-        PM10.set(pms_data.pm_ug_per_m3(10))
+    pms_data = get_particulates()
+    
+    PM1.set(pms_data.pm_ug_per_m3(1.0))
+    PM25.set(pms_data.pm_ug_per_m3(2.5))
+    PM10.set(pms_data.pm_ug_per_m3(10))
 
-        PM1_HIST.observe(pms_data.pm_ug_per_m3(1.0))
-        PM25_HIST.observe(pms_data.pm_ug_per_m3(2.5) - pms_data.pm_ug_per_m3(1.0))
-        PM10_HIST.observe(pms_data.pm_ug_per_m3(10) - pms_data.pm_ug_per_m3(2.5))
+    PM1_HIST.observe(pms_data.pm_ug_per_m3(1.0))
+    PM25_HIST.observe(pms_data.pm_ug_per_m3(2.5) - pms_data.pm_ug_per_m3(1.0))
+    PM10_HIST.observe(pms_data.pm_ug_per_m3(10) - pms_data.pm_ug_per_m3(2.5))
 
 def collect_all_data():
     """Collects all the data currently set"""
@@ -298,8 +231,9 @@ if __name__ == '__main__':
     if args.debug:
         DEBUG = True
 
-    if args.factor:
-        logging.info("Using compensating algorithm (factor={}) to account for heat leakage from Raspberry Pi board".format(args.factor))
+    factor = args.factor or ENVIROPLUS_FACTOR
+    if factor:
+        logging.info("Using compensating algorithm (factor={}) to account for heat leakage from Raspberry Pi board".format(factor))
 
     if args.influxdb:
         # Post to InfluxDB in another thread
@@ -317,12 +251,12 @@ if __name__ == '__main__':
     logging.info("Listening on http://{}:{}".format(args.bind, args.port))
 
     while True:
-        get_temperature(args.factor)
-        get_pressure()
-        get_humidity()
-        get_light()
+        read_temperature(factor)
+        read_pressure()
+        read_humidity()
+        read_light()
         if not args.enviro:
-            get_gas()
-            get_particulates()
+            read_gas()
+            read_particulates()
         if DEBUG:
             logging.info('Sensor data: {}'.format(collect_all_data()))
